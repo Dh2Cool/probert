@@ -242,7 +242,7 @@ You might resize at 25000000 bytes or 25 MB (freeing 75 MB).
         size_bytes.return_value = 2 << 30
         tmpdir_cls.return_value.__enter__.return_value = (
             '/tmp/probert-btrfs-test')
-        run.return_value = ''
+        run.return_value = 'num_devices\t\t1\n'
         min_dev_size.return_value = 500 << 20
 
         expected = {
@@ -256,6 +256,19 @@ You might resize at 25000000 bytes or 25 MB (freeing 75 MB).
         min_dev_size.assert_awaited_once_with('/tmp/probert-btrfs-test')
         run.assert_any_await(['umount', '--', '/tmp/probert-btrfs-test'])
         tmpdir_cls.return_value.__exit__.assert_called_once()
+
+    @patch('probert.filesystem.arun', new_callable=AsyncMock)
+    @patch('probert.filesystem._device_size_bytes')
+    @patch('probert.filesystem.shutil.which', Mock(return_value='/sbin/btrfs'))
+    async def test_btrfs_sizing_multi_device(self, size_bytes, run):
+        size_bytes.return_value = 2 << 30
+        run.return_value = 'num_devices\t\t2\n'
+
+        expected = {'SIZE': 2 << 30, 'ESTIMATED_MIN_SIZE': -1}
+        self.assertEqual(expected, await get_btrfs_sizing(self.device))
+        run.assert_awaited_once_with(
+            ['/sbin/btrfs', 'inspect-internal', 'dump-super', '--',
+             self.device.device_node])
 
     @patch('probert.filesystem.shutil.which')
     async def test_btrfs_sizing_btrfs_not_found(self, which):

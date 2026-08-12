@@ -96,11 +96,12 @@ async def _temporary_mount(path, fstype, *, options='ro'):
 
 
 async def get_btrfs_sizing(device):
-    """Estimate size limits for a single-device btrfs filesystem.
+    """Estimate size limits for a btrfs filesystem.
 
     btrfs inspect-internal min-dev-size requires a mount point (not a raw
-    block device), so mount read-only temporarily. Multi-device btrfs is
-    out of scope.
+    block device), so mount read-only temporarily. Multi-device btrfs
+    cannot be safely resized, so report ESTIMATED_MIN_SIZE = -1 (subiquity's
+    sentinel for hiding guided resize) without probing further.
     """
     path = device.device_node
     btrfs = shutil.which('btrfs')
@@ -113,6 +114,19 @@ async def get_btrfs_sizing(device):
         log.debug(
             'btrfs volume size not found: could not determine device size')
         return None
+
+    # Multi-device btrfs cannot be safely resized, so report -1 rather than a
+    # single device's min size.
+    dump = await arun([btrfs, 'inspect-internal', 'dump-super', '--', path])
+    num_devices = None
+    for line in (dump or '').splitlines():
+        m = re.fullmatch(r'num_devices\s+(\d+)', line.strip())
+        if m:
+            num_devices = int(m.group(1))
+            break
+    if num_devices != 1:
+        # SIZE is this member device's size, not the whole volume.
+        return {'SIZE': size, 'ESTIMATED_MIN_SIZE': -1}
 
     async with _temporary_mount(path, 'btrfs') as mountpoint:
         if mountpoint is None:
