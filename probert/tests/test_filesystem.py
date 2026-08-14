@@ -24,6 +24,8 @@ from probert.filesystem import (
     get_ext_sizing,
     get_ntfs_sizing,
     get_swap_sizing,
+    get_btrfs_min_dev_size,
+    get_btrfs_sizing,
     get_device_filesystem,
 )
 
@@ -212,3 +214,84 @@ You might resize at 25000000 bytes or 25 MB (freeing 75 MB).
     async def test_resize2fs_not_found(self, which):
         which.return_value = None
         self.assertEqual(None, await get_resize2fs_info(self.device))
+
+    # Unlike other sizing tools, btrfs min-dev-size real output is just one
+    # line, so a separate "real output" fixture test would be redundant.
+    @patch('probert.filesystem.arun')
+    @patch('probert.filesystem.shutil.which', Mock(return_value='/sbin/btrfs'))
+    async def test_btrfs_min_dev_size(self, run):
+        run.return_value = '104517861376 bytes (97.34GiB)\n'
+        self.assertEqual(104517861376,
+                         await get_btrfs_min_dev_size('/mnt/btrfs'))
+        run.assert_awaited_once_with(
+            ['/sbin/btrfs', 'inspect-internal', 'min-dev-size', '--',
+             '/mnt/btrfs'])
+
+    @patch('probert.filesystem.shutil.which')
+    async def test_btrfs_min_dev_size_not_found(self, which):
+        which.return_value = None
+        self.assertIsNone(await get_btrfs_min_dev_size('/mnt/btrfs'))
+
+    @patch('probert.filesystem.tempfile.TemporaryDirectory')
+    @patch('probert.filesystem.arun', new_callable=AsyncMock)
+    @patch('probert.filesystem.get_btrfs_min_dev_size', new_callable=AsyncMock)
+    @patch('probert.filesystem._device_size_bytes')
+    @patch('probert.filesystem.shutil.which', Mock(return_value='/sbin/btrfs'))
+    async def test_btrfs_sizing(
+            self, size_bytes, min_dev_size, run, tmpdir_cls):
+        size_bytes.return_value = 2 << 30
+        tmpdir_cls.return_value.__enter__.return_value = (
+            '/tmp/probert-btrfs-test')
+        run.return_value = 'num_devices\t\t1\n'
+        min_dev_size.return_value = 500 << 20
+
+        expected = {
+            'SIZE': 2 << 30,
+            'ESTIMATED_MIN_SIZE': 500 << 20,
+        }
+        self.assertEqual(expected, await get_btrfs_sizing(self.device))
+        run.assert_any_await(
+            ['mount', '-t', 'btrfs', '-o', 'ro', '--',
+             self.device.device_node, '/tmp/probert-btrfs-test'])
+        min_dev_size.assert_awaited_once_with('/tmp/probert-btrfs-test')
+        run.assert_any_await(['umount', '--', '/tmp/probert-btrfs-test'])
+        tmpdir_cls.return_value.__exit__.assert_called_once()
+
+    @patch('probert.filesystem.arun', new_callable=AsyncMock)
+    @patch('probert.filesystem._device_size_bytes')
+    @patch('probert.filesystem.shutil.which', Mock(return_value='/sbin/btrfs'))
+    async def test_btrfs_sizing_multi_device(self, size_bytes, run):
+        size_bytes.return_value = 2 << 30
+        run.return_value = 'num_devices\t\t2\n'
+
+        expected = {'SIZE': 2 << 30, 'ESTIMATED_MIN_SIZE': -1}
+        self.assertEqual(expected, await get_btrfs_sizing(self.device))
+        run.assert_awaited_once_with(
+            ['/sbin/btrfs', 'inspect-internal', 'dump-super', '--',
+             self.device.device_node])
+
+    @patch('probert.filesystem.shutil.which')
+    async def test_btrfs_sizing_btrfs_not_found(self, which):
+        which.return_value = None
+        self.assertIsNone(await get_btrfs_sizing(self.device))
+
+    @patch('probert.filesystem._device_size_bytes')
+    @patch('probert.filesystem.shutil.which', Mock(return_value='/sbin/btrfs'))
+    async def test_btrfs_sizing_no_device_size(self, size_bytes):
+        size_bytes.return_value = 0
+        self.assertIsNone(await get_btrfs_sizing(self.device))
+
+    async def test_get_device_filesystem_sizing_btrfs(self):
+        data = {'ID_FS_TYPE': 'btrfs'}
+        self.device.properties = Mock()
+        self.device.properties.__iter__ = Mock(return_value=iter(data))
+        self.device.properties.__getitem__ = lambda _, x: data[x]
+        size_info = {'ESTIMATED_MIN_SIZE': 1 << 20, 'SIZE': 10 << 20}
+        btrfs = AsyncMock()
+        btrfs.return_value = size_info
+        with patch.dict('probert.filesystem.sizing_tools',
+                        {'btrfs': btrfs}, clear=True):
+            expected = size_info.copy()
+            expected['TYPE'] = 'btrfs'
+            actual = await get_device_filesystem(self.device, True)
+            self.assertEqual(expected, actual)

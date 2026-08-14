@@ -13,18 +13,126 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import asyncio
+import contextlib
 import logging
 import re
 import shutil
+import tempfile
 
 import pyudev
 
 from probert.utils import (
     arun,
+    read_sys_block_size_bytes,
     sane_block_devices,
+    SECTOR_SIZE_BYTES,
 )
 
 log = logging.getLogger('probert.filesystems')
+
+
+def _device_size_bytes(device):
+    try:
+        if 'ID_PART_ENTRY_SIZE' in device:
+            return int(device['ID_PART_ENTRY_SIZE']) * SECTOR_SIZE_BYTES
+    except (TypeError, ValueError):
+        log.debug(
+            f'{device.device_node} size not found: ID_PART_ENTRY_SIZE has '
+            f'an unexpected value: {device["ID_PART_ENTRY_SIZE"]}')
+
+    try:
+        return read_sys_block_size_bytes(device.device_node)
+    except (OSError, ValueError):
+        log.debug(
+            f'{device.device_node} size not found: '
+            'read_sys_block_size_bytes failed')
+
+    try:
+        return int(device.get('attrs', {}).get('size', 0))
+    except (AttributeError, TypeError, ValueError):
+        log.debug(
+            f'{device.device_node} size not found: device.attrs has an '
+            f'unexpected value: {device.get("attrs")}')
+    return 0
+
+
+async def get_btrfs_min_dev_size(mountpoint):
+    btrfs = shutil.which('btrfs')
+    if btrfs is None:
+        log.debug('btrfs volume size not found: btrfs not found')
+        return None
+    out = await arun(
+        [btrfs, 'inspect-internal', 'min-dev-size', '--', mountpoint])
+    if out is None:
+        log.debug('btrfs volume size not found: min-dev-size failure')
+        return None
+    # 104517861376 bytes (97.34GiB)
+    minsize_matcher = re.compile(r'(\d+) bytes.*')
+    for line in out.splitlines():
+        m = minsize_matcher.fullmatch(line)
+        if m:
+            return int(m.group(1))
+    log.debug('btrfs volume size not found: unexpected output format')
+    return None
+
+
+@contextlib.asynccontextmanager
+async def _temporary_mount(path, fstype, *, options='ro'):
+    """Mount *path* read-only at a temporary directory and yield it.
+
+    Yields None if the mount fails. Assumes mount/umount are present.
+    """
+    with tempfile.TemporaryDirectory(prefix=f'probert-{fstype}-') as tmpdir:
+        mounted = await arun(
+            ['mount', '-t', fstype, '-o', options, '--', path, tmpdir])
+        if mounted is None:
+            log.debug(f'{fstype} volume size not found: mount failure')
+            yield None
+            return
+        try:
+            yield tmpdir
+        finally:
+            await arun(['umount', '--', tmpdir])
+
+
+async def get_btrfs_sizing(device):
+    """Estimate size limits for a btrfs filesystem.
+
+    btrfs inspect-internal min-dev-size requires a mount point (not a raw
+    block device), so mount read-only temporarily. Multi-device btrfs
+    cannot be safely resized, so report ESTIMATED_MIN_SIZE = -1 (subiquity's
+    sentinel for hiding guided resize) without probing further.
+    """
+    path = device.device_node
+    btrfs = shutil.which('btrfs')
+    if btrfs is None:
+        log.debug('btrfs volume size not found: btrfs not found')
+        return None
+
+    size = _device_size_bytes(device)
+    if not size:
+        log.debug(
+            'btrfs volume size not found: could not determine device size')
+        return None
+
+    # Multi-device btrfs cannot be safely resized, so report -1 rather than a
+    # single device's min size.
+    dump = await arun([btrfs, 'inspect-internal', 'dump-super', '--', path])
+    num_devices = None
+    for line in (dump or '').splitlines():
+        m = re.fullmatch(r'num_devices\s+(\d+)', line.strip())
+        if m:
+            num_devices = int(m.group(1))
+            break
+    if num_devices != 1:
+        # SIZE is this member device's size, not the whole volume.
+        return {'SIZE': size, 'ESTIMATED_MIN_SIZE': -1}
+
+    async with _temporary_mount(path, 'btrfs') as mountpoint:
+        if mountpoint is None:
+            return None
+        min_size = await get_btrfs_min_dev_size(mountpoint)
+    return {'SIZE': size, 'ESTIMATED_MIN_SIZE': min_size}
 
 
 async def get_dumpe2fs_info(path):
@@ -132,7 +240,7 @@ async def get_ntfs_sizing(device):
 
 async def get_swap_sizing(device):
     if 'ID_PART_ENTRY_SIZE' in device:
-        size = int(device['ID_PART_ENTRY_SIZE']) * 512
+        size = int(device['ID_PART_ENTRY_SIZE']) * SECTOR_SIZE_BYTES
     else:
         size = int(device.get('attrs', {}).get('size', 0))
     if not size:
@@ -145,6 +253,7 @@ async def get_swap_sizing(device):
 
 
 sizing_tools = {
+    'btrfs': get_btrfs_sizing,
     'ext2': get_ext_sizing,
     'ext3': get_ext_sizing,
     'ext4': get_ext_sizing,
