@@ -30,6 +30,9 @@ from probert.utils import (
 
 log = logging.getLogger('probert.filesystems')
 
+MIB = 1 << 20
+VFAT_MIN_HEADROOM = 32 * MIB
+
 
 def _device_size_bytes(device):
     try:
@@ -133,6 +136,45 @@ async def get_btrfs_sizing(device):
             return None
         min_size = await get_btrfs_min_dev_size(mountpoint)
     return {'SIZE': size, 'ESTIMATED_MIN_SIZE': min_size}
+
+
+async def get_vfat_sizing(device):
+    """Estimate a conservative minimum size for a FAT filesystem.
+
+    fsck.fat -n is read-only; with -v it prints the cluster size and the
+    used/total cluster counts, from which we derive the bytes in use. Any FAT
+    width (FAT12/16/32) is accepted. Returns the -1 "unknown" sentinel (which
+    hides guided resize) on any failure - the same way get_btrfs_sizing does.
+    """
+    size = _device_size_bytes(device)
+    if not size:
+        return None
+
+    unknown = {'SIZE': size, 'ESTIMATED_MIN_SIZE': -1}
+    fsck = shutil.which('fsck.fat')
+    if fsck is None:
+        log.debug('vfat volume size not found: fsck.fat not found')
+        return unknown
+    output = await arun([fsck, '-n', '-v', device.device_node])
+    if output is None:
+        log.debug('vfat volume size not found: fsck.fat failure')
+        return unknown
+
+    cluster_size = used_clusters = None
+    for line in output.splitlines():
+        m = re.search(r'(\d+) bytes per cluster', line)
+        if m:
+            cluster_size = int(m.group(1))
+        m = re.search(r'(\d+)\s*/\s*\d+ clusters', line)
+        if m:
+            used_clusters = int(m.group(1))
+    if not cluster_size or used_clusters is None:
+        log.debug('vfat volume size not found: unexpected fsck.fat output')
+        return unknown
+
+    used = used_clusters * cluster_size
+    minimum = ((used + VFAT_MIN_HEADROOM + MIB - 1) // MIB) * MIB
+    return {'SIZE': size, 'ESTIMATED_MIN_SIZE': min(size, minimum)}
 
 
 async def get_dumpe2fs_info(path):
@@ -259,6 +301,7 @@ sizing_tools = {
     'ext4': get_ext_sizing,
     'ntfs': get_ntfs_sizing,
     'swap': get_swap_sizing,
+    'vfat': get_vfat_sizing,
 }
 
 

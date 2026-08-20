@@ -26,6 +26,7 @@ from probert.filesystem import (
     get_swap_sizing,
     get_btrfs_min_dev_size,
     get_btrfs_sizing,
+    get_vfat_sizing,
     get_device_filesystem,
 )
 
@@ -295,3 +296,42 @@ You might resize at 25000000 bytes or 25 MB (freeing 75 MB).
             expected['TYPE'] = 'btrfs'
             actual = await get_device_filesystem(self.device, True)
             self.assertEqual(expected, actual)
+
+
+class TestVfatSizing(IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.device = Mock(device_node='/dev/vda1')
+
+    @patch('probert.filesystem.arun', new_callable=AsyncMock)
+    @patch('probert.filesystem._device_size_bytes', return_value=128 << 20)
+    @patch('probert.filesystem.shutil.which', return_value='/sbin/fsck.fat')
+    async def test_minimum_from_usage(self, _which, _size, run):
+        # The estimate comes purely from fsck.fat's used-cluster report; the
+        # FAT width is never consulted, so FAT16 and FAT32 behave identically.
+        run.return_value = '4096 bytes per cluster\n1024 / 32700 clusters\n'
+        # used = 1024 * 4096 = 4 MiB; + 32 MiB headroom, MiB-aligned = 36 MiB.
+        self.assertEqual({
+            'SIZE': 128 << 20,
+            'ESTIMATED_MIN_SIZE': 36 << 20,
+        }, await get_vfat_sizing(self.device))
+        run.assert_awaited_once_with(
+            ['/sbin/fsck.fat', '-n', '-v', '/dev/vda1'])
+
+    @patch('probert.filesystem.arun', new_callable=AsyncMock)
+    @patch('probert.filesystem._device_size_bytes', return_value=128 << 20)
+    @patch('probert.filesystem.shutil.which', return_value='/sbin/fsck.fat')
+    async def test_unparseable_fsck_is_unknown(self, _which, _size, run):
+        run.return_value = 'filesystem looks fine, probably\n'
+        self.assertEqual({
+            'SIZE': 128 << 20,
+            'ESTIMATED_MIN_SIZE': -1,
+        }, await get_vfat_sizing(self.device))
+
+    @patch('probert.filesystem.arun', new_callable=AsyncMock)
+    @patch('probert.filesystem._device_size_bytes', return_value=128 << 20)
+    @patch('probert.filesystem.shutil.which', return_value=None)
+    async def test_missing_fsck_is_unknown(self, _which, _size, _run):
+        self.assertEqual({
+            'SIZE': 128 << 20,
+            'ESTIMATED_MIN_SIZE': -1,
+        }, await get_vfat_sizing(self.device))
